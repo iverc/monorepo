@@ -673,10 +673,9 @@ where
                 );
                 self.awaiting_target = true;
             }
-            // No candidate produced a usable response: the current round cannot
-            // verify, so stop pursuing this target and take the newest update.
-            // Productive rounds never reach this arm and keep their hold.
-            None => self.awaiting_target = true,
+            // No candidate produced a usable response; the gap remains open and
+            // scheduling reissues the request.
+            None => {}
         }
 
         Ok(())
