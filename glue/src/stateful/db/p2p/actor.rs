@@ -270,6 +270,7 @@ where
                     (&key, &response),
                     (Request::Operations { .. }, Response::Operations { .. })
                         | (Request::Boundary { .. }, Response::Boundary { .. })
+                        | (_, Response::Pruned { .. })
                 ) =>
             {
                 response
@@ -339,6 +340,7 @@ where
 
             let Ok((response, _feedback)) = result else {
                 serve_requests.inc(status::Status::Failure);
+                tracing::warn!(?key, error = ?result.err(), "qmdb serve failed");
                 return;
             };
 
@@ -590,7 +592,7 @@ mod tests {
     }
 
     async fn init_db(context: deterministic::Context, suffix: &str) -> Shared<TestDb> {
-        let db = TestDb::init(context.child("db"), db_config(suffix, &context))
+        let db = TestDb::init(context.child("db"), db_config(suffix, &context), None)
             .await
             .expect("db init should succeed");
         Shared::new("test", db)
@@ -598,7 +600,7 @@ mod tests {
 
     /// Create a database with one applied update.
     async fn init_seeded_db(context: deterministic::Context, suffix: &str) -> Shared<TestDb> {
-        let db = TestDb::init(context.child("db"), db_config(suffix, &context))
+        let db = TestDb::init(context.child("db"), db_config(suffix, &context), None)
             .await
             .expect("db init should succeed");
         let key = Sha256::hash(&[suffix.as_bytes(), b"-key"]);
