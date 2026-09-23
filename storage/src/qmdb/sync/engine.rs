@@ -74,7 +74,7 @@ where
     Op: Encode,
     H: Hasher,
 {
-    if response.proof().leaves != request.size() {
+    if response.is_pruned() || response.proof().leaves != request.size() {
         return false;
     }
 
@@ -259,6 +259,16 @@ where
 
     /// Tracks whether the current target has already been reported as reached.
     reached_current_target_reported: bool,
+    /// Set when every source reports the current target as pruned; scheduling
+    /// pauses until the next advancing target update.
+    awaiting_target: bool,
+    /// Newest target update withheld while the journal is within reach of the
+    /// target end and the target has not been reached yet.
+    stashed_target: Option<Target<DB::Family, DB::Digest>>,
+    /// Whether verified operations were stored for the current target: the
+    /// hold below protects demonstrated progress, so targets without any
+    /// verified work are superseded immediately.
+    applied_since_target: bool,
 }
 
 #[cfg(test)]
@@ -333,6 +343,9 @@ where
             finish_rx: config.finish_rx,
             reached_target_tx: config.reached_target_tx,
             reached_current_target_reported: false,
+            awaiting_target: false,
+            stashed_target: None,
+            applied_since_target: false,
             metrics,
         };
         engine.schedule_requests();
@@ -349,6 +362,13 @@ where
                 let result: Result<_, S::Error> = async {
                     let (mut response, mut feedback) = source.serve(request).await?;
                     loop {
+                        if matches!(response, Response::Pruned { .. }) {
+                            if let Some(feedback) = feedback {
+                                feedback.accept();
+                            }
+                            tracing::warn!(?request, "sync request pruned at source");
+                            return Ok(Some(response));
+                        }
                         if verify_response::<DB::Family, DB::Op, DB::Hasher>(
                             request, &root, &response,
                         ) {
@@ -375,6 +395,9 @@ where
 
     /// Schedule new fetch requests for operations in the sync range that we haven't yet fetched.
     fn schedule_requests(&mut self) {
+        if self.awaiting_target {
+            return;
+        }
         let target_size = self.target.range.end();
 
         // Schedule a boundary request at the lower sync bound if pinned nodes are still
@@ -434,9 +457,12 @@ where
         mut self,
         new_target: Target<DB::Family, DB::Digest>,
     ) -> Result<Self, Error<DB, S>> {
+        let start_moved = self.target.range.start() != new_target.range.start();
         self.journal = self.journal.resize(new_target.range.start()).await?;
-        self.fetched_operations.clear();
-        self.pinned_nodes = None;
+        if start_moved {
+            self.fetched_operations.clear();
+            self.pinned_nodes = None;
+        }
 
         // Retain the prior target size so its fetches stay eligible until eviction.
         if self.max_retained_roots > 0 {
@@ -446,16 +472,24 @@ where
             }
         }
 
-        // Preserve operation fetches for retained targets beyond the new lower bound.
-        // The lower bound never decreases, so this cancels old boundary requests and
-        // leaves the new boundary free for fetching pinned nodes.
+        // Preserve fetches for retained targets at or beyond the new lower bound;
+        // their late responses verify against retained sizes. Boundary requests
+        // survive only at an unchanged start (they seed the journal position),
+        // while a moved start cancels them so the fresh size can fetch pinned
+        // nodes.
         let new_start = new_target.range.start();
         self.outstanding_requests.retain(|request| {
-            request.start() > new_start && self.retained_sizes.contains(&request.size())
+            let eligible = match request {
+                Request::Operations { .. } => request.start() >= new_start,
+                Request::Boundary { start, .. } => *start == new_start,
+            };
+            eligible && self.retained_sizes.contains(&request.size())
         });
 
         self.target = new_target;
         self.reached_current_target_reported = false;
+        self.awaiting_target = false;
+        self.applied_since_target = false;
         Ok(self)
     }
 
@@ -613,23 +647,35 @@ where
             return Ok(());
         };
 
-        let response = fetch_result
-            .result
-            .map_err(SyncError::Source)?
-            .ok_or(SyncError::Engine(EngineError::InvalidResponse))?;
+        let response = fetch_result.result.map_err(SyncError::Source)?;
 
         let start_loc = request.start();
         match response {
-            Response::Operations { operations, .. } => {
+            Some(Response::Operations { operations, .. }) => {
                 self.store_operations(start_loc, operations);
+                self.applied_since_target = true;
             }
-            Response::Boundary {
+            Some(Response::Boundary {
                 op, pinned_nodes, ..
-            } => {
+            }) => {
                 // A tracked boundary request belongs to the current target.
                 self.pinned_nodes = Some(pinned_nodes);
                 self.store_operations(start_loc, vec![op]);
+                self.applied_since_target = true;
             }
+            Some(Response::Pruned { frontier }) => {
+                // Every reachable source pruned past this target; stop requesting
+                // it and wait for the next advancing target update.
+                tracing::warn!(
+                    ?request,
+                    frontier = *frontier,
+                    "sync target pruned at all sources; awaiting target update"
+                );
+                self.awaiting_target = true;
+            }
+            // No candidate produced a usable response; the gap remains open and
+            // scheduling reissues the request.
+            None => {}
         }
 
         Ok(())
@@ -644,6 +690,21 @@ where
             Event::TargetUpdate(new_target) => {
                 // A non-advancing update is discarded.
                 if !new_target.advances(&self.target) {
+                    return Ok(NextStep::Continue(self));
+                }
+                // The journal is within one fetch round of the target end: hold
+                // the target still so the remaining operations and a size-exact
+                // boundary response can land, and stash the update for later
+                // application. Chasing the live tip instead moves the expected
+                // proof size faster than one fetch round can complete.
+                let within_reach = self.journal.size() + 2 * self.fetch_batch_size.get()
+                    >= *self.target.range.end();
+                if !self.finish_requested
+                    && within_reach
+                    && self.applied_since_target
+                    && !self.reached_current_target_reported
+                {
+                    self.stashed_target = Some(new_target);
                     return Ok(NextStep::Continue(self));
                 }
                 // A same-root update that advances is impossible for an append-only log and
@@ -693,28 +754,25 @@ where
     #[boxed]
     pub(crate) async fn step(mut self) -> Result<NextStep<Self, DB>, Error<DB, S>> {
         self.drain_finish_requests()?;
+        if self.awaiting_target
+            && let Some(stashed) = self.stashed_target.take()
+            && stashed.advances(&self.target)
+        {
+            // Force the reset: routing through handle_event would re-stash
+            // (the journal is still within reach) and spin without clearing
+            // the pruned-target pause.
+            let mut updated = self.reset_for_target_update(stashed).await?;
+            updated.record_progress();
+            updated.schedule_requests();
+            return Ok(NextStep::Continue(updated));
+        }
 
         // Check if sync is complete
         if self.is_ready_to_complete()? {
-            // Take a queued target update before completing at the old target, unless the
-            // caller already asked to finish. Updates that do not advance the target are
-            // discarded.
-            if !self.finish_requested {
-                while let Some(update_rx) = self.update_rx.as_mut() {
-                    match update_rx.try_recv() {
-                        Ok(new_target) => {
-                            if new_target.advances(&self.target) {
-                                return self.handle_event(Event::TargetUpdate(new_target)).await;
-                            }
-                        }
-                        Err(TryRecvError::Empty) => break,
-                        Err(TryRecvError::Disconnected) => {
-                            self.update_rx = None;
-                        }
-                    }
-                }
-            }
-
+            // Complete at the reached target rather than deferring to newer updates:
+            // the set coordinator regroups stragglers, and the application replays
+            // finalized blocks after the anchor, so converging slightly behind the
+            // tip is preferred over never converging under continuous updates.
             self.report_reached_target().await;
 
             if self.finish_rx.is_some() {
@@ -1035,9 +1093,12 @@ mod tests {
             let mut engine = engine.reset_for_target_update(target_2).await.unwrap();
 
             assert_eq!(engine.retained_sizes, BTreeSet::from([Location::new(10)]));
-            assert!(!engine.outstanding_requests.contains(&Location::new(5)));
+            // The boundary request at the unchanged start survives: it seeds the
+            // journal position, and its late response verifies against the
+            // retained size. Root eviction below still cancels it.
+            assert!(engine.outstanding_requests.contains(&Location::new(5)));
             assert!(engine.outstanding_requests.contains(&Location::new(6)));
-            assert_eq!(engine.outstanding_requests.len(), 1);
+            assert_eq!(engine.outstanding_requests.len(), 2);
 
             insert_pending_request(
                 &mut engine,
@@ -1047,7 +1108,7 @@ mod tests {
                     max_ops: NZU64!(1),
                 },
             );
-            assert_eq!(engine.outstanding_requests.len(), 2);
+            assert_eq!(engine.outstanding_requests.len(), 3);
             let queued_old_result = stale_fetch_result(old_operation_id);
             let target_3 = Target {
                 root: sha256::Digest::from([3u8; 32]),
@@ -1121,13 +1182,17 @@ mod tests {
     }
 
     #[test]
-    fn step_takes_queued_update_before_completing() {
+    fn step_completes_at_the_reached_target_despite_queued_updates() {
         deterministic::Runner::default().start(|context| async move {
             let (update_tx, update_rx) = mpsc::channel(2);
             let mut config = test_engine_config(context, 10, Arc::new(AtomicUsize::new(0)));
+            // TestDb's root, so completion's final check passes.
+            config.target.root = sha256::Digest::from([0u8; 32]);
             config.update_rx = Some(update_rx);
-            // Queue a stale update and an advancing one. The stale one is discarded and
-            // the advancing one retargets the engine instead of completing.
+            // Queue a stale update and an advancing one. The engine completes at
+            // its reached target instead of chasing newer updates: the caller
+            // regroups stragglers and replays what follows the anchor, and
+            // deferring forever never converges under continuous updates.
             let stale = Target {
                 root: sha256::Digest::from([2u8; 32]),
                 range: non_empty_range!(Location::new(5), Location::new(10)),
@@ -1140,10 +1205,10 @@ mod tests {
             update_tx.send(advancing.clone()).await.unwrap();
 
             let engine = Engine::new(config).await.unwrap();
-            let NextStep::Continue(engine) = engine.step().await.unwrap() else {
-                panic!("engine should retarget instead of completing");
+            let NextStep::Complete(database) = engine.step().await.unwrap() else {
+                panic!("engine should complete at the reached target");
             };
-            assert_eq!(engine.target, advancing);
+            let _ = database;
         });
     }
 
